@@ -2,27 +2,16 @@
  * Note: On Windows, it's not possible to resize shared memory after
  * it's created.
  */
-#include "such_shared_memory.h"
 
 #if defined( __WIN32__ ) || defined( _WIN32 )
 # define ON_WINDOWS 1
+# define _CRT_SECURE_NO_WARNINGS /* allow old-style C functions. */
 #else
 # define ON_WINDOWS 0
 #endif
 
-// platform-specific headers.
-#if ON_WINDOWS
-#include <windows.h>
-typedef int     bool;
-#define false   0
-#define true    1
-#define INLINE
-#else
-#include <sys/mman.h>
-#include <sys/stat.h> /* For mode constants */
-#include <fcntl.h> /* For O_* constants */
-#define INLINE  inline
-#endif
+// module header.
+#include "such_shared_memory.h"
 
 // standard headers.
 #include <stdlib.h>
@@ -30,6 +19,28 @@ typedef int     bool;
 #include <string.h>
 #include <assert.h>
 #include <limits.h>
+#include <stdarg.h>
+
+// platform-specific headers.
+#if ON_WINDOWS
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h> /* For mode constants */
+#include <fcntl.h> /* For O_* constants */
+#endif
+
+// platform-specific definitions.
+#if ON_WINDOWS
+# define INLINE
+# define va_copy( dst, src )  ( (dst) = (src) )
+#else
+# define INLINE  inline
+#endif
+
+typedef int     bool;
+#define false   0
+#define true    1
 
 #define ssmMalloc( n )    malloc( n )
 #define ssmCalloc( n )    calloc( 1, n )
@@ -59,6 +70,27 @@ static int64_t  ssmPlatformQuerySize( ssm_t* ssm );
 
 static char*    strDup( const char* str );
 static char*    strJoin( const char* s1, const char* s2 );
+static char*    strVFmt( const char* fmt, va_list va );
+static char*    strFmt( const char* fmt, ... );
+
+#define LOG_FATAL   1
+#define LOG_ERROR   2
+#define LOG_WARN    3
+#define LOG_INFO    4
+
+static bool     ssmShouldLog( int verbosity, int level );
+static void     ssmVLog( ssm_t* ssm, int level, const char* fmt, va_list va );
+static void     ssmFatal( ssm_t* ssm, const char* fmt, ... )  { va_list va; va_start( va, fmt ); ssmVLog( ssm, LOG_FATAL, fmt, va ); va_end( va ); }
+static void     ssmError( ssm_t* ssm, const char* fmt, ... )  { va_list va; va_start( va, fmt ); ssmVLog( ssm, LOG_ERROR, fmt, va ); va_end( va ); }
+static void     ssmWarn( ssm_t* ssm, const char* fmt, ... )   { va_list va; va_start( va, fmt ); ssmVLog( ssm, LOG_WARN, fmt, va ); va_end( va ); }
+static void     ssmInfo( ssm_t* ssm, const char* fmt, ... )   { va_list va; va_start( va, fmt ); ssmVLog( ssm, LOG_INFO, fmt, va ); va_end( va ); }
+
+#define ssmAssert( cond )                                       \
+  if ( !( cond ) )                                              \
+  {                                                             \
+    ssmFatal( ssm, "assertion failed:  %s", #cond );            \
+    exit( 1 );                                                  \
+  }                         
 
 //==============================================================================
 // struct ssm_s
@@ -66,7 +98,9 @@ static char*    strJoin( const char* s1, const char* s2 );
 struct ssm_s
 {
   int64_t   size;
+  int64_t   memSize;
   char*     name;
+  char*     nameInternal;
 
   void*     mem;
 #if ON_WINDOWS
@@ -76,37 +110,44 @@ struct ssm_s
 #else
   int       fd;
 #endif
+
+  int       verbosity;
+  int       flags;
+  bool      created;
 };
 
 //------------------------------------------------------------------------------
 SSM_API ssm_t*
-such_shared_memory_open( int version, const char* name, int64_t size, int flags )
+such_shared_memory_open( int version, int verbosity, const char* name, int64_t size, int flags )
 {
   if ( version != SSM_VERSION )
   {
-    fprintf( stderr, "such_shared_memory_open(\"%s\"): version mismatch.  Expected %d, got %d\n", name, SSM_VERSION, version );
-    return NULL;
-  }
-
-  if ( size < 0 )
-  {
-    fprintf( stderr, "such_shared_memory_open(\"%s\"): size < 0.\n", name );
+    ssmError( NULL, "verison mismatch.  Expected %d, got %d", SSM_VERSION, version );
     return NULL;
   }
 
   {
     ssm_t* ssm = ssmNew( ssm_t );
-    ssm->size = size;
-    ssm->name = strDup( name );
 #if ON_WINDOWS
     ssm->fd = INVALID_HANDLE_VALUE;
 #else
     ssm->fd = -1;
 #endif
 
-    if ( ssmPlatformOpen( ssm ) )
+    ssm->verbosity = verbosity;
+    ssm->name = strDup( name );
+    ssm->size = size;
+    ssm->flags = flags;
+
+    ssmInfo( ssm, "open()" );
+
+
+    if ( size < 0 )
+      ssmError( ssm, "size is %lld", (int64_t)size );
+    else
     {
-      return ssm;
+      if ( ssmPlatformOpen( ssm ) )
+        return ssm;
     }
 
     such_shared_memory_close( ssm );
@@ -120,6 +161,7 @@ such_shared_memory_close( ssm_t* ssm )
 {
   if ( !ssm )
     return;
+  ssmInfo( ssm, "close()" );
 
   ssmPlatformClose( ssm );
   ssmFree( ssm->name );
@@ -162,7 +204,7 @@ ssmPlatformOpen( ssm_t* ssm )
 
 #if ON_WINDOWS
   {
-    assert( ssm->fd == INVALID_HANDLE_VALUE );
+    ssmAssert( ssm->fd == INVALID_HANDLE_VALUE );
 
     /* open ntdll.dll and get the NtQuerySection function. */
     {
@@ -171,7 +213,7 @@ ssmPlatformOpen( ssm_t* ssm )
         ssm->hNtdll = LoadLibraryA( "Ntdll.dll" );
         if ( ssm->hNtdll == NULL )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): LoadLibraryA(\"Ntdll.dll\") failed with %d\n", ssm->name, GetLastError() );
+          ssmError( ssm, "LoadLibraryA(\"Ntdll.dll\") failed with %d\n", GetLastError() );
           ssmPlatformClose( ssm );
           return false;
         }
@@ -182,7 +224,7 @@ ssmPlatformOpen( ssm_t* ssm )
         ssm->NtQuerySection = (NtQuerySection_t)GetProcAddress( ssm->hNtdll, "NtQuerySection" );
         if ( !ssm->NtQuerySection )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): GetProcAddress(\"NtQuerySection\") failed with %d\n", ssm->name, GetLastError() );
+          ssmError( ssm, "GetProcAddress(\"NtQuerySection\") failed with %d\n", GetLastError() );
           ssmPlatformClose( ssm );
           return false;
         }
@@ -192,52 +234,74 @@ ssmPlatformOpen( ssm_t* ssm )
     /* create the file mapping. */
     {
       HANDLE h = NULL;
-      char* name = strJoin( "Global\\", ssm->name );
-      int64_t size = ssm->size;
+      HANDLE hOpened = NULL;
 
-      if ( false && ( size <= 0 ) )
+      ssmAssert( ssm->nameInternal == NULL );
+      ssm->nameInternal = strJoin( "Global\\", ssm->name );
+
+      if ( ssm->size <= 0 )
       {
-        h = OpenFileMappingA(
+        hOpened = OpenFileMappingA(
             FILE_MAP_WRITE,
             false,
-            name );
-      }
-      else 
-      {
-        if ( size <= 0 )
-          size = 1;
+            ssm->nameInternal );
 
-        h = CreateFileMappingA(
-            INVALID_HANDLE_VALUE, /* backed by pagefile. */
-            NULL, /* default security attributes. */
-            PAGE_READWRITE,
-            ( size >> 32 ), 
-            ( size & 0xFFFFFFFF ),
-            name );
-      }
-
-      ssmFree( name );
-
-      if ( h == NULL )
-      {
-        if ( size > 0 )
+        if ( hOpened == NULL )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): CreateFileMappingA() failed with %d\n", ssm->name, GetLastError() );
+          ssmWarn( ssm, "OpenFileMappingA() failed with %d", GetLastError() );
         }
-        else
+
+        /*
+        if ( hOpened == NULL )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): OpenFileMappingA() failed with %d\n", ssm->name, GetLastError() );
+          ssmError( ssm, "OpenFileMappingA() failed with %d", GetLastError() );
+          ssmPlatformClose( ssm );
+          return false;
         }
-        ssmPlatformClose( ssm );
-        return false;
+        */
       }
 
-      assert( h != INVALID_HANDLE_VALUE );
+      {
+        if ( ( hOpened != NULL ) || ( ssm->size > 0 ) )
+        {
+          int64_t size = ssm->size;
+          if ( size <= 0 )
+            size = 1;
+
+          h = CreateFileMappingA(
+              INVALID_HANDLE_VALUE, /* backed by pagefile. */
+              NULL, /* default security attributes. */
+              PAGE_READWRITE,
+              ( size >> 32 ), 
+              ( size & 0xFFFFFFFF ),
+              ssm->nameInternal );
+        }
+
+        /* if we opened the shared memory, then release it, since we
+         * just acquired it via CreateFileMapping. */
+        if ( hOpened != NULL )
+        {
+          CloseHandle( hOpened );
+          hOpened = NULL;
+        }
+
+        if ( h == NULL )
+        {
+          if ( ssm->size > 0 )
+          {
+            ssmError( ssm, "CreateFileMappingA() failed with %d", GetLastError() );
+          }
+          ssmPlatformClose( ssm );
+          return false;
+        }
+      }
+
+      ssmAssert( h != INVALID_HANDLE_VALUE );
       ssm->fd = h;
     }
 
-    printf( "such_shared_memory_open(\"%s\"): Existing size is %lld\n", ssm->name, ssmPlatformQuerySize( ssm ) );
-    printf( "such_shared_memory_open(\"%s\"): Determined size: %lld\n", ssm->name, (int64_t)ssmPlatformDetermineSize( ssm ) );
+    ssmInfo( ssm, "Existing size: %lld", ssmPlatformQuerySize( ssm ) );
+    ssmInfo( ssm, "Determined size: %lld", (int64_t)ssmPlatformDetermineSize( ssm ) );
 
     /* map the memory. */
     {
@@ -245,14 +309,14 @@ ssmPlatformOpen( ssm_t* ssm )
       size_t size = ssmPlatformDetermineSize( ssm );
       if ( size == 0 )
       {
-        fprintf( stderr, "such_shared_memory_open(\"%s\"): ssmPlatformDetermineSize() failed\n", ssm->name );
+        ssmError( ssm, "ssmPlatformDetermineSize() failed\n" );
         ssmPlatformClose( ssm );
         return false;
       }
 
       /* map the memory. */
       {
-        printf( "such_shared_memory_open(\"%s\"): Mapping size: %lld\n", ssm->name, (int64_t)size );
+        ssmInfo( ssm, "Mapping size: %lld", (int64_t)size );
 
         ssm->mem = MapViewOfFile(
             ssm->fd,
@@ -263,12 +327,12 @@ ssmPlatformOpen( ssm_t* ssm )
 
         if ( ssm->mem == NULL )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): MapViewOfFile() failed with %d\n", ssm->name, GetLastError() );
+          ssmError( ssm, "MapViewOfFile() failed with %d\n", GetLastError() );
           ssmPlatformClose( ssm );
           return false;
         }
 
-        ssm->size = size;
+        ssm->memSize = size;
       }
     }
 
@@ -277,6 +341,7 @@ ssmPlatformOpen( ssm_t* ssm )
 #else
   // TODO
 #endif
+  return false;
 }
 
 //------------------------------------------------------------------------------
@@ -307,6 +372,8 @@ ssmPlatformClose( ssm_t* ssm )
 #else
   // TODO
 #endif
+
+  ssmFree( ssm->nameInternal );
 }
 
 //------------------------------------------------------------------------------
@@ -315,7 +382,6 @@ ssmPlatformQuerySize( ssm_t* ssm )
 {
   if ( ssm )
   {
-
 #if ON_WINDOWS
     if ( ssm->NtQuerySection )
     {
@@ -325,7 +391,7 @@ ssmPlatformQuerySize( ssm_t* ssm )
 
         if ( FAILED( ssm->NtQuerySection( ssm->fd, 0, &sbi, sizeof( SECTION_BASIC_INFORMATION ), 0 ) ) )
         {
-          fprintf( stderr, "such_shared_memory_open(\"%s\"): NtQuerySection() failed with %d\n", ssm->name, GetLastError() );
+          ssmError( ssm, "NtQuerySection() failed with %d\n", GetLastError() );
         }
         else
         {
@@ -364,5 +430,125 @@ strJoin( const char* sA, const char* sB )
   ssmMemCpy( s, sA, sAsize );
   ssmMemCpy( s + sAsize, sB, sBsize + 1 );
   return s;
+}
+
+//------------------------------------------------------------------------------
+static char*
+strVFmt( const char* fmt, va_list va )
+{
+  char* ret = NULL;
+  size_t size = 0;
+  va_list va1;
+  va_list va2;
+  va_copy( va1, va );
+  va_copy( va2, va );
+  size = vsnprintf( NULL, 0, fmt, va1 );
+  assert( size > 0 );
+  if ( size > 0 )
+  {
+    ret = ssmMalloc( size + 1 );
+    vsnprintf( ret, size + 1, fmt, va2 );
+  }
+  va_end( va2 );
+  va_end( va1 );
+  return ret;
+}
+
+//------------------------------------------------------------------------------
+static char*
+strFmt( const char* fmt, ... )
+{
+  char* ret = NULL;
+  va_list va;
+  va_start( va, fmt );
+  ret = strVFmt( fmt, va );
+  va_end( va );
+  return ret;
+}
+
+//------------------------------------------------------------------------------
+static bool
+ssmShouldLog( int verbosity, int level )
+{
+  if ( level == LOG_FATAL )
+    return true;
+
+  if ( verbosity == SSMV_QUIET )
+    return false;
+
+  if ( verbosity == SSMV_ALL )
+    return true;
+
+  switch ( level )
+  {
+    case LOG_ERROR: return verbosity >= SSMV_ERRORS;
+    case LOG_WARN: return verbosity >= SSMV_WARNINGS;
+    case LOG_INFO: return verbosity >= SSMV_INFO;
+  }
+  assert( false );
+  return false;
+}
+
+//------------------------------------------------------------------------------
+static const char*
+ssmGetLevelStr( int level )
+{
+  switch ( level )
+  {
+    case LOG_FATAL:
+      return "[FATAL]";
+    case LOG_ERROR:
+      return "[ERR]";
+    case LOG_WARN:
+      return "[WARN]";
+    case LOG_INFO:
+      return "[INFO]";
+    default:
+      return "[UNK]";
+  }
+}
+
+//------------------------------------------------------------------------------
+static void
+ssmVLog( ssm_t* ssm, int level, const char* fmt, va_list va )
+{
+  int verbosity = SSMV_ALL;
+  if ( ssm )
+    verbosity = ssm->verbosity;
+
+  if ( ssmShouldLog( verbosity, level ) )
+  {
+    char* msg = strVFmt( fmt, va );
+
+    {
+      char* body = msg;
+      char* header = NULL;
+      if ( ssm )
+        header = strFmt( "such_shared_memory( \"%s\", %lld, %lld ):", ssm->name, (int64_t)ssm->size, (int64_t)ssm->flags );
+      else
+        header = strFmt( "such_shared_memory:" );
+      msg = strFmt( "%s %s \t%s\n", ssmGetLevelStr( level ), header, msg );
+      ssmFree( body );
+      ssmFree( header );
+    }
+
+    switch ( level )
+    {
+      case LOG_INFO:
+        fprintf( stdout, "%s", msg );
+        break;
+      case LOG_WARN:
+      case LOG_ERROR:
+      case LOG_FATAL:
+      default:
+        fprintf( stderr, "%s", msg );
+        break;
+    }
+
+    ssmFree( msg );
+  }
+
+  if ( level == LOG_FATAL )
+    exit( 1 );
 }
 

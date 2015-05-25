@@ -3,7 +3,7 @@ project(such_shared_memory)
 
 if (WIN32)
 else ()
-  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --std=c99 -g -Wall -Werror -pedantic")
+  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --std=c99 -g -Wall -Werror -pedantic -Wno-unused-function")
 endif (WIN32)
 
 include_directories(include/such_shared_memory)
