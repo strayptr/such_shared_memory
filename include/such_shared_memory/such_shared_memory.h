@@ -22,7 +22,10 @@ extern "C" {
 struct ssm_s;
 typedef struct ssm_s ssm_t;
 
-SSM_API ssm_t*      such_shared_memory_open( int version, const char* name, int64_t size );
+#define SSM_OPEN_MUST_CREATE        (1 << 0)
+#define SSM_OPEN_MUST_NOT_CREATE    (1 << 1)
+
+SSM_API ssm_t*      such_shared_memory_open( int version, const char* name, int64_t size, int flags );
 SSM_API void        such_shared_memory_close( ssm_t* ssm );
 
 
