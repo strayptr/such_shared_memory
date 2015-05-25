@@ -1,3 +1,7 @@
+/*
+ * Note: On Windows, it's not possible to resize shared memory after
+ * it's created.
+ */
 #include "such_shared_memory.h"
 
 #if defined( __WIN32__ ) || defined( _WIN32 )
@@ -12,10 +16,12 @@
 typedef int     bool;
 #define false   0
 #define true    1
+#define INLINE
 #else
 #include <sys/mman.h>
 #include <sys/stat.h> /* For mode constants */
 #include <fcntl.h> /* For O_* constants */
+#define INLINE  inline
 #endif
 
 // standard headers.
@@ -23,6 +29,7 @@ typedef int     bool;
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 #define ssmMalloc( n )    malloc( n )
 #define ssmCalloc( n )    calloc( 1, n )
@@ -30,6 +37,12 @@ typedef int     bool;
 #define ssmNew( type )    ssmCalloc( sizeof( type ) )
 #define ssmDel( p )       ssmFree( p )
 #define ssmMemCpy( dst, src, n )   memcpy( dst, src, n )
+
+#if UINTPTR_MAX <= UINT_MAX
+# define IS_32BIT    1
+#else
+# define IS_32BIT    0
+#endif
 
 #if ON_WINDOWS
 typedef struct _SECTION_BASIC_INFORMATION {
@@ -118,9 +131,35 @@ such_shared_memory_close( ssm_t* ssm )
 //==============================================================================
 
 //------------------------------------------------------------------------------
+static size_t
+ssmPlatformDetermineSize( ssm_t* ssm )
+{
+  int64_t size = ssmPlatformQuerySize( ssm );
+  if ( size < 0 )
+    return 0;
+
+  /* do we want to map less than the whole file size? */
+  if ( ( ssm->size > 0 ) && ( ssm->size < size ) )
+    size = ssm->size;
+
+#if IS_32BIT
+  /* on 32-bit platforms, map only up to 1.5GB. */
+  if ( size > ( ( 1024LL + 512LL ) * 1024 * 1024 ) )
+    return ( ( 1024LL + 512LL ) * 1024 * 1024 );
+#endif
+
+#if IS_32BIT
+  assert( size <= 0xFFFFFFFF );
+#endif
+  return (size_t)size;
+}
+
+//------------------------------------------------------------------------------
 static bool
 ssmPlatformOpen( ssm_t* ssm )
 {
+  ssmPlatformClose( ssm );
+
 #if ON_WINDOWS
   {
     assert( ssm->fd == INVALID_HANDLE_VALUE );
@@ -152,21 +191,43 @@ ssmPlatformOpen( ssm_t* ssm )
 
     /* create the file mapping. */
     {
+      HANDLE h = NULL;
       char* name = strJoin( "Global\\", ssm->name );
+      int64_t size = ssm->size;
 
-      HANDLE h = CreateFileMappingA(
-          INVALID_HANDLE_VALUE, /* backed by pagefile. */
-          NULL, /* default security attributes. */
-          PAGE_READWRITE,
-          ( ssm->size >> 32 ), 
-          ( ssm->size & 0xFFFFFFFF ),
-          name );
+      if ( false && ( size <= 0 ) )
+      {
+        h = OpenFileMappingA(
+            FILE_MAP_WRITE,
+            false,
+            name );
+      }
+      else 
+      {
+        if ( size <= 0 )
+          size = 1;
+
+        h = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, /* backed by pagefile. */
+            NULL, /* default security attributes. */
+            PAGE_READWRITE,
+            ( size >> 32 ), 
+            ( size & 0xFFFFFFFF ),
+            name );
+      }
 
       ssmFree( name );
 
       if ( h == NULL )
       {
-        fprintf( stderr, "such_shared_memory_open(\"%s\"): CreateFileMappingA() failed with %d\n", ssm->name, GetLastError() );
+        if ( size > 0 )
+        {
+          fprintf( stderr, "such_shared_memory_open(\"%s\"): CreateFileMappingA() failed with %d\n", ssm->name, GetLastError() );
+        }
+        else
+        {
+          fprintf( stderr, "such_shared_memory_open(\"%s\"): OpenFileMappingA() failed with %d\n", ssm->name, GetLastError() );
+        }
         ssmPlatformClose( ssm );
         return false;
       }
@@ -176,43 +237,38 @@ ssmPlatformOpen( ssm_t* ssm )
     }
 
     printf( "such_shared_memory_open(\"%s\"): Existing size is %lld\n", ssm->name, ssmPlatformQuerySize( ssm ) );
+    printf( "such_shared_memory_open(\"%s\"): Determined size: %lld\n", ssm->name, (int64_t)ssmPlatformDetermineSize( ssm ) );
 
     /* map the memory. */
     {
       /* determine the size. */
-      size_t size = 0;
+      size_t size = ssmPlatformDetermineSize( ssm );
+      if ( size == 0 )
       {
-        if ( sizeof( size_t ) == 8 )
+        fprintf( stderr, "such_shared_memory_open(\"%s\"): ssmPlatformDetermineSize() failed\n", ssm->name );
+        ssmPlatformClose( ssm );
+        return false;
+      }
+
+      /* map the memory. */
+      {
+        printf( "such_shared_memory_open(\"%s\"): Mapping size: %lld\n", ssm->name, (int64_t)size );
+
+        ssm->mem = MapViewOfFile(
+            ssm->fd,
+            FILE_MAP_WRITE,
+            0,
+            0,
+            size );
+
+        if ( ssm->mem == NULL )
         {
-          if ( ssm->size > 0xFFFFFFFF )
-            ssm->size = 0xFFFFFFFF;
-          else
-            size = (size_t)ssm->size;
-        }
-        else if ( sizeof( size_t ) == 4 )
-        {
-          size = (size_t)ssm->size;
-        }
-        else 
-        {
-          assert( !"not implemented" );
+          fprintf( stderr, "such_shared_memory_open(\"%s\"): MapViewOfFile() failed with %d\n", ssm->name, GetLastError() );
           ssmPlatformClose( ssm );
           return false;
         }
-      }
 
-      ssm->mem = MapViewOfFile(
-          ssm->fd,
-          FILE_MAP_WRITE,
-          0,
-          0,
-          size );
-
-      if ( ssm->mem == NULL )
-      {
-        fprintf( stderr, "such_shared_memory_open(\"%s\"): MapViewOfFile() failed with %d\n", ssm->name, GetLastError() );
-        ssmPlatformClose( ssm );
-        return false;
+        ssm->size = size;
       }
     }
 
@@ -267,7 +323,7 @@ ssmPlatformQuerySize( ssm_t* ssm )
       {
         SECTION_BASIC_INFORMATION sbi;
 
-        if ( ssm->NtQuerySection( ssm->fd, 0, &sbi, sizeof( SECTION_BASIC_INFORMATION ), 0 ) )
+        if ( FAILED( ssm->NtQuerySection( ssm->fd, 0, &sbi, sizeof( SECTION_BASIC_INFORMATION ), 0 ) ) )
         {
           fprintf( stderr, "such_shared_memory_open(\"%s\"): NtQuerySection() failed with %d\n", ssm->name, GetLastError() );
         }
