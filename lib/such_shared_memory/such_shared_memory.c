@@ -32,10 +32,10 @@
 
 // platform-specific definitions.
 #if ON_WINDOWS
-# define INLINE
+# define INLINE   static
 # define va_copy( dst, src )  ( (dst) = (src) )
 #else
-# define INLINE  inline
+# define INLINE   static inline
 #endif
 
 typedef int     bool;
@@ -93,6 +93,418 @@ static void     ssmInfo( ssm_t* ssm, const char* fmt, ... )   { va_list va; va_s
   }                         
 
 //==============================================================================
+// cross-platform atomics.
+//==============================================================================
+#if ON_WINDOWS
+// Windows atomics.
+INLINE int32_t xinc32 ( volatile int32_t* x )                                   { return InterlockedIncrement( x ); }
+INLINE int32_t xdec32 ( volatile int32_t* x )                                   { return InterlockedDecrement( x ); }
+INLINE void*   xcasp  ( volatile void** dst, void* oldval, void* newval )       { return InterlockedCompareExchangePointer( dst, newval, oldval ); }
+INLINE int32_t xcas32 ( volatile int32_t* dst, int32_t oldval, int32_t newval ) { return InterlockedCompareExchange( dst, newval, oldval ); }
+INLINE void*   xchgp  ( volatile void** dst, void* newval )                     { return InterlockedExchangePointer( dst, newval ); }
+INLINE int32_t xchg32 ( volatile int32_t* dst, int32_t newval )                 { return InterlockedExchange( dst, newval ); }
+INLINE void    xyield()       { SwitchToThread(); }
+INLINE void    xfence()       { MemoryBarrier(); }
+INLINE void    xfenceread()   { MemoryBarrier(); }
+INLINE void    xfencewrite()  { MemoryBarrier(); }
+INLINE int32_t xthreadid()    { DWORD id = GetCurrentThreadId(); return *(int32_t*)&id; }
+#define XInvalidThreadID      0 
+#else
+// non-Windows atomics.
+#include <sys/types.h> /* for gettid() */
+INLINE int32_t xthreadid()    { return gettid(); }
+#define XInvalidThreadID      0 
+#error TODO
+#endif
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// common atomics.
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#define xread( val )        ( xfenceread(), (val) )
+#define xwrite( dst, src )  { (dst) = (src); xfencewrite(); }
+
+typedef volatile int32_t  xlock_t;
+typedef int32_t           xlockstate;
+
+#define XLock_None     0
+#define XLock_Locked   1
+#define XLock_Unlocked 2
+
+//------------------------------------------------------------------------------
+INLINE xlockstate xlock( xlock_t* lock )
+{
+  int32_t tid = xthreadid();
+
+  while ( true )
+  {
+    int32_t oldval = xcas32( lock, XInvalidThreadID, tid );
+    if ( oldval == XInvalidThreadID )
+      return XLock_Locked;
+
+    /* allow the current thread to lock multiple times without deadlocking. */
+    if ( oldval == tid )
+      return XLock_Unlocked;
+
+    xyield();
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void xunlock( xlock_t* lock, xlockstate locked )
+{
+  if ( locked == XLock_Locked )
+  {
+    int32_t oldval = xchg32( lock, 0 );
+    assert( oldval == xthreadid() );
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE xlockstate xbeginp( volatile void** dst, void* cmp, xlock_t* lock )
+{
+  if ( xread( *dst ) == cmp )
+  {
+    xlockstate locked = xlock( lock );
+    {
+      if ( xread( *dst ) == cmp )
+        return locked;
+    }
+    xunlock( lock, locked );
+  }
+  return XLock_None;
+}
+
+//------------------------------------------------------------------------------
+INLINE xlockstate xgetp( volatile void** dst, xlock_t* lock )
+{
+  while ( true )
+  {
+    xlockstate locked = xbeginp( dst, xread( *dst ), lock );
+    if ( locked != XLock_None )
+      return locked;
+    xyield();
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void xendp( volatile void** dst, void* newval, xlock_t* lock, xlockstate locked )
+{
+  xwrite( *dst, newval );
+  xunlock( lock, locked );
+}
+
+//------------------------------------------------------------------------------
+INLINE xlockstate xbegin32( volatile int32_t* dst, const int32_t cmp, xlock_t* lock )
+{
+  if ( xread( *dst ) == cmp )
+  {
+    xlockstate locked = xlock( lock );
+    {
+      if ( xread( *dst ) == cmp )
+        return locked;
+    }
+    xunlock( lock, locked );
+  }
+  return XLock_None;
+}
+
+//------------------------------------------------------------------------------
+INLINE xlockstate xget32( volatile int32_t* dst, xlock_t* lock )
+{
+  while ( true )
+  {
+    xlockstate locked = xbegin32( dst, xread( *dst ), lock );
+    if ( locked != XLock_None )
+      return locked;
+    xyield();
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void xend32( volatile int32_t* dst, const int32_t newval, xlock_t* lock, xlockstate locked )
+{
+  xwrite( *dst, newval );
+  xunlock( lock, locked );
+}
+
+//------------------------------------------------------------------------------
+typedef struct xrefstate_s
+{
+  volatile int32_t* refcount;
+  xlock_t*          lock;
+  xlockstate        locked;
+  int32_t           newcount;
+} xrefstate_t;
+
+//------------------------------------------------------------------------------
+INLINE void xrefend( xrefstate_t* xr )
+{
+  if ( xr->locked != XLock_None )
+  {
+    xend32( xr->refcount, xr->newcount, xr->lock, xr->locked );
+    xr->locked = XLock_None;
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE bool xrefacquire( xrefstate_t* xr, volatile int32_t* refcount, xlock_t* lock )
+{
+  xr->locked = xget32( refcount, lock );
+  xr->refcount = refcount;
+  xr->lock = lock;
+  xr->newcount = ( xread( *refcount ) + 1 );
+  assert( xr->newcount >= 1 );
+  return ( xr->newcount == 1 );
+}
+
+//------------------------------------------------------------------------------
+INLINE bool xrefrelease( volatile int32_t* refcount, xlock_t* lock )
+{
+  xr->locked = xget32( refcount, lock );
+  xr->refcount = refcount;
+  xr->lock = lock;
+  xr->newcount = ( xread( *refcount ) - 1 );
+  assert( xr->newcount >= 0 );
+  return ( xr->newcount == 0 );
+}
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// CPU cache line helpers.
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#define CacheLineSize 64    /* bytes */
+
+#define CacheLineBegin( name )    \
+  union                           \
+  {                               \
+    volatile int32_t  cacheline_##name[ CacheLineSize / sizeof( int32_t ) ]; \
+    struct
+#define CacheLineEnd()            \
+    ;                             \
+  };
+
+//==============================================================================
+// cross-platform synchronization primitives.
+//==============================================================================
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// xsection
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+typedef struct xsection_s
+{
+  volatile int32_t            refcount;
+  volatile int32_t            lock;
+#if ON_WINDOWS
+  CRITICAL_SECTION            cs;
+#else
+#error TODO
+#endif
+} xsection_t;
+
+#define XSECTION_SPIN_COUNT   4000
+
+//------------------------------------------------------------------------------
+INLINE void
+xsection_enter( xsection_t* sec )
+{
+  assert( sec );
+
+  /* need initialization? */
+  {
+    if ( xbegin32( &sec->refcount, 0, &sec->lock ) )
+    {
+#if ON_WINDOWS
+      if ( !InitializeCriticalSectionAndSpinCount( &sec->cs, spincount ) )
+      {
+        assert( !"InitializeCriticalSectionAndSpinCount failed" );
+      }
+#else
+#error TODO
+#endif
+    }
+    xend32( &sec->refcount, 1, sec->lock );
+  }
+
+  /* platform-specific enter critical section. */
+  {
+    assert( xread( sec->refcount ) > 0 );
+
+#if ON_WINDOWS
+    EnterCriticalSection( &sec->cs );
+#else
+#error TODO
+#endif
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void
+xsection_leave( xsection_t* sec )
+{
+  assert( sec );
+
+  /* platform-specific leave critical section. */
+  {
+    assert( xread( sec->refcount ) > 0 );
+
+#if ON_WINDOWS
+    LeaveCriticalSection( &sec->cs );
+#else
+#error TODO
+#endif
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void
+xsection_addref( xsection_t* sec )
+{
+  assert( sec );
+  {
+    xrefstate_t xr;
+    if ( xrefacquire( &xr, sec->refcount, sec->lock ) )
+    {
+#if ON_WINODWS
+      if ( !InitializeCriticalSectionAndSpinCount( &sec->cs, XSECTION_SPIN_COUNT ) )
+      {
+        assert( !"InitializeCriticalSectionAndSpinCount failed" );
+      }
+#else
+#error TODO
+#endif
+    }
+    xrefend( &xr );
+  }
+}
+
+//------------------------------------------------------------------------------
+INLINE void
+xsection_release( xsection_t* sec )
+{
+  assert( sec );
+  {
+    xrefstate_t xr;
+    if ( xrefrelease( &xr, sec->refcount, sec->lock ) )
+    {
+#if ON_WINODWS
+      DeleteCriticalSection( &sec->cs );
+#else
+#error TODO
+#endif
+    }
+    xrefend( &xr );
+  }
+}
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// xref
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+typedef struct xref_s 
+{
+  CacheLineBegin( line )
+  {
+    volatile int32_t     refcount;
+    volatile xsection_t  sec;
+  }
+  CacheLineEnd();
+
+  volatile void*      instance;
+} xref_t;
+
+INLINE bool     xref_acquire( xref_t* xref )
+{
+  if ( inc32( &xref->refcount ) > 1 )
+    return false;
+
+  return true;
+}
+INLINE void     xref_acquired( xref_t* xref, void* obj );
+INLINE void*    xref_release( xref_t* xref );
+INLINE void     xref_released( xref_t* xref );
+
+//==============================================================================
+// per-process state.
+//==============================================================================
+typedef struct ssm_singleton_s
+{
+#if ON_WINDOWS
+  HMODULE           hNtdll;
+  NtQuerySection_t  NtQuerySection;
+#else
+  int               foo;
+#endif
+} ssm_singleton_t;
+
+static void*
+
+
+static ssm_singleton_t   g_ssm;
+
+//------------------------------------------------------------------------------
+SSM_API int
+such_shared_memory_startup( int version )
+{
+  if ( version != SSM_VERSION )
+  {
+    ssmError( NULL, "startup(): DLL verison mismatch.  Expected %d, got %d", SSM_VERSION, version );
+    return 0;
+  }
+
+  assert( g_ssm.refcount >= 0 );
+
+  if ( xinc32( &g_ssm.refcount ) == 1 )
+  {
+#if ON_WINDOWS
+    /* open ntdll.dll and get the NtQuerySection function. */
+    {
+      if ( !g_ssm.hNtdll )
+      {
+        g_ssm.hNtdll = LoadLibraryA( "Ntdll.dll" );
+        if ( g_ssm.hNtdll == NULL )
+        {
+          ssmError( NULL, "startup(): LoadLibraryA(\"Ntdll.dll\") failed with %d\n", GetLastError() );
+          such_shared_memory_shutdown();
+          return -1;
+        }
+      }
+
+      if ( !g_ssm.NtQuerySection )
+      {
+        assert( g_ssm.hNtdll != NULL );
+        g_ssm.NtQuerySection = (NtQuerySection_t)GetProcAddress( g_ssm.hNtdll, "NtQuerySection" );
+        if ( !g_ssm.NtQuerySection )
+        {
+          ssmError( NULL, "startup(): GetProcAddress(\"NtQuerySection\") failed with %d\n", GetLastError() );
+          such_shared_memory_shutdown();
+          return -1;
+        }
+      }
+    }
+#endif
+  }
+  return g_ssm.refcount;
+}
+
+//------------------------------------------------------------------------------
+SSM_API int
+such_shared_memory_shutdown()
+{
+  assert( g_ssm.refcount > 0 );
+  --g_ssm.refcount;
+  if ( g_ssm.refcount == 0 )
+  {
+#if ON_WINDOWS
+    if ( g_ssm.hNtdll )
+    {
+      FreeLibrary( g_ssm.hNtdll );
+      g_ssm.hNtdll = NULL;
+      g_ssm.NtQuerySection = NULL;
+    }
+#endif
+  }
+  return g_ssm.refcount;
+}
+
+//==============================================================================
 // struct ssm_s
 //==============================================================================
 struct ssm_s
@@ -105,8 +517,6 @@ struct ssm_s
   void*     mem;
 #if ON_WINDOWS
   HANDLE    fd;
-  HMODULE   hNtdll;
-  NtQuerySection_t  NtQuerySection;
 #else
   int       fd;
 #endif
@@ -205,31 +615,6 @@ ssmPlatformOpen( ssm_t* ssm )
 #if ON_WINDOWS
   {
     ssmAssert( ssm->fd == INVALID_HANDLE_VALUE );
-
-    /* open ntdll.dll and get the NtQuerySection function. */
-    {
-      if ( !ssm->hNtdll )
-      {
-        ssm->hNtdll = LoadLibraryA( "Ntdll.dll" );
-        if ( ssm->hNtdll == NULL )
-        {
-          ssmError( ssm, "LoadLibraryA(\"Ntdll.dll\") failed with %d\n", GetLastError() );
-          ssmPlatformClose( ssm );
-          return false;
-        }
-      }
-
-      if ( !ssm->NtQuerySection )
-      {
-        ssm->NtQuerySection = (NtQuerySection_t)GetProcAddress( ssm->hNtdll, "NtQuerySection" );
-        if ( !ssm->NtQuerySection )
-        {
-          ssmError( ssm, "GetProcAddress(\"NtQuerySection\") failed with %d\n", GetLastError() );
-          ssmPlatformClose( ssm );
-          return false;
-        }
-      }
-    }
 
     /* create the file mapping. */
     {
@@ -350,13 +735,6 @@ ssmPlatformClose( ssm_t* ssm )
 {
 #if ON_WINDOWS
   {
-    if ( ssm->hNtdll )
-    {
-      FreeLibrary( ssm->hNtdll );
-      ssm->hNtdll = NULL;
-      ssm->NtQuerySection = NULL;
-    }
-
     if ( ssm->mem )
     {
       UnmapViewOfFile( ssm->mem );
@@ -383,20 +761,19 @@ ssmPlatformQuerySize( ssm_t* ssm )
   if ( ssm )
   {
 #if ON_WINDOWS
-    if ( ssm->NtQuerySection )
-    {
-      if ( ssm->fd != INVALID_HANDLE_VALUE )
-      {
-        SECTION_BASIC_INFORMATION sbi;
+    ssmAssert( g_ssm.NtQuerySection != NULL );
 
-        if ( FAILED( ssm->NtQuerySection( ssm->fd, 0, &sbi, sizeof( SECTION_BASIC_INFORMATION ), 0 ) ) )
-        {
-          ssmError( ssm, "NtQuerySection() failed with %d\n", GetLastError() );
-        }
-        else
-        {
-          return sbi.SectionSize.QuadPart;
-        }
+    if ( ssm->fd != INVALID_HANDLE_VALUE )
+    {
+      SECTION_BASIC_INFORMATION sbi;
+
+      if ( FAILED( g_ssm.NtQuerySection( ssm->fd, 0, &sbi, sizeof( SECTION_BASIC_INFORMATION ), 0 ) ) )
+      {
+        ssmError( ssm, "NtQuerySection() failed with %d\n", GetLastError() );
+      }
+      else
+      {
+        return sbi.SectionSize.QuadPart;
       }
     }
 #else

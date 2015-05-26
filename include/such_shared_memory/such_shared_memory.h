@@ -30,7 +30,7 @@ typedef struct ssm_s ssm_t;
 #define SSMV_INFO        2 /* will log errors, warnings, and info messages. */
 #define SSMV_QUIET      10 /* will not log anything. */
 
-SSM_API ssm_t*      such_shared_memory_open( int ssm_version, int ssmv_verbosity, const char* name, int64_t size, int ssmf_flags );
+SSM_API ssm_t*      such_shared_memory_open( const char* name, int64_t size, int ssmf_flags );
 SSM_API void        such_shared_memory_close( ssm_t* ssm );
 
 
